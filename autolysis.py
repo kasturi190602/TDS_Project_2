@@ -4,230 +4,276 @@
 #   "pandas",
 #   "matplotlib",
 #   "seaborn",
-#   "openai",
-#   "rich",
+#   "openai>=0.27.0",
+#   "tenacity",
 #   "scikit-learn"
 # ]
 # ///
 
 import os
 import sys
-import base64
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tenacity import retry, stop_after_attempt, wait_exponential
 import openai
-from rich.console import Console
+import shutil
 from sklearn.ensemble import IsolationForest
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.feature_selection import mutual_info_classif
 from sklearn.preprocessing import StandardScaler
+from concurrent.futures import ThreadPoolExecutor
 
-# Initialize console for rich logging
-console = Console()
+# Fetch API Token
+# Ensure the API token is set in the environment variables for OpenAI authentication
+api_token = os.getenv("AIPROXY_TOKEN")
+if not api_token:
+    print("Error: AIPROXY_TOKEN environment variable not set.")
+    sys.exit(1)
 
-# Configure OpenAI
-openai.api_key = os.environ.get("AIPROXY_TOKEN")
+# Parse command-line argument
+# The script expects exactly one argument: the path to the dataset file
+if len(sys.argv) != 2:
+    print("Usage: uv run autolysis.py <dataset.csv>")
+    sys.exit(1)
 
-def load_dataset(filename):
-    """Load dataset with flexible options."""
+dataset_path = sys.argv[1]
+
+# Load the dataset
+# Attempt to load the dataset with UTF-8 encoding for broad compatibility with most files.
+# Fallback to Latin1 encoding if UTF-8 fails, as it supports a wider range of characters.
+try:
+    df = pd.read_csv(dataset_path, encoding="utf-8")
+    print(f"Loaded dataset with {df.shape[0]} rows and {df.shape[1]} columns.")
+except UnicodeDecodeError:
     try:
-        console.log(f"[bold blue]Loading dataset:[/] {filename}")
-        return pd.read_csv(filename, encoding="utf-8")
-    except UnicodeDecodeError:
-        return pd.read_csv(filename, encoding="ISO-8859-1")
+        df = pd.read_csv(dataset_path, encoding="latin1")
+        print(f"Loaded dataset with {df.shape[0]} rows and {df.shape[1]} columns using latin1 encoding.")
     except Exception as e:
-        console.log(f"[yellow]Fallback to alternative delimiters:[/] {e}")
-        return pd.read_csv(filename, delimiter=';', encoding="utf-8")
+        print(f"Error loading dataset: {e}")
+        sys.exit(1)
+except Exception as e:
+    print(f"Error loading dataset: {e}")
+    sys.exit(1)
 
-def detect_outliers(data):
-    """Detect outliers using Isolation Forest."""
-    numeric_data = data.select_dtypes(include='number')
-    if numeric_data.empty:
-        return None
+# Limit dataset size for faster processing
+# If the dataset is too large, sample up to 10,000 rows to optimize runtime
+if df.shape[0] > 10000:
+    print("Dataset too large, sampling 10,000 rows for analysis.")
+    df = df.sample(10000, random_state=42)
 
-    console.log("[cyan]Performing outlier detection...")
-    model = IsolationForest(contamination=0.1, random_state=42)
-    outliers = model.fit_predict(numeric_data)
-    data['Outlier'] = (outliers == -1)
-    return data
+# Ensure necessary directories exist
+# Create directories to store outputs for different datasets
+required_dirs = ["goodreads", "happiness", "media"]
+for directory in required_dirs:
+    os.makedirs(directory, exist_ok=True)
 
-def perform_clustering(data):
-    """Perform KMeans clustering on numeric data."""
-    numeric_data = data.select_dtypes(include='number')
-    if numeric_data.shape[1] < 2:
-        return None
+# Perform generic analysis
+# Generate summary statistics and count missing values in the dataset
+summary = df.describe(include="all").transpose()
+missing_values = df.isnull().sum()
 
-    console.log("[cyan]Performing clustering...")
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(numeric_data)
-    kmeans = KMeans(n_clusters=3, random_state=42)
-    data['Cluster'] = kmeans.fit_predict(scaled_data)
-    return data
+# Filter numeric columns for correlation calculation
+# Correlation matrix is computed only if there are multiple numeric columns
+# Explanation: A correlation matrix requires at least two numeric columns to compute relationships. 
+# Single numeric columns provide no meaningful pairwise comparisons.
+numeric_df = df.select_dtypes(include=["number"])
+if numeric_df.shape[1] > 1:
+    correlation = numeric_df.corr()
+else:
+    correlation = None
 
-def perform_pca(data):
-    """Perform Principal Component Analysis (PCA) on numeric data."""
-    numeric_data = data.select_dtypes(include='number')
-    if numeric_data.shape[1] < 2:
-        return None
+# Function to query LLM with enhanced error handling and logging
+# This function interacts with the OpenAI API to generate insights or narratives
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=20), reraise=True)
+def query_llm(prompt):
+    # This function queries the OpenAI API for narrative or analysis suggestions based on the provided prompt.
+    try:
+        openai.api_key = api_token
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for data analysis."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        # Validate response structure
+        if "choices" in response and response["choices"]:
+            return response["choices"][0]["message"]["content"]
+        else:
+            raise ValueError("Invalid response structure from OpenAI API.")
+    except openai.error.OpenAIError as e:
+        print(f"OpenAI API error: {e}")
+        raise
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise
 
-    console.log("[cyan]Performing PCA...")
-    scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(numeric_data)
-    pca = PCA(n_components=2)
-    components = pca.fit_transform(scaled_data)
-    data['PCA1'] = components[:, 0]
-    data['PCA2'] = components[:, 1]
-
-    # Scatter plot for PCA
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x='PCA1', y='PCA2', hue='Cluster', data=data, palette='tab10')
-    plt.title("PCA Scatterplot")
-    plt.savefig("pca_scatterplot.png")
-    plt.close()
-
-    return data
-
-def visualize_data(data):
-    """Generate advanced visualizations."""
-    numeric_data = data.select_dtypes(include='number')
-
-    if not numeric_data.empty:
-        console.log("[cyan]Generating correlation heatmap...")
+# Advanced Analysis Functions
+# Create a correlation heatmap to visualize relationships between numeric features
+def create_correlation_heatmap():
+    if correlation is not None:
         plt.figure(figsize=(10, 8))
-        sns.heatmap(numeric_data.corr(), annot=True, cmap="coolwarm")
+        sns.heatmap(correlation, annot=True, cmap="coolwarm", cbar_kws={'label': 'Correlation Coefficient'})
         plt.title("Correlation Heatmap")
+        plt.xlabel("Features")
+        plt.ylabel("Features")
         plt.savefig("correlation_heatmap.png")
         plt.close()
 
-        console.log("[cyan]Generating boxplot...")
-        plt.figure(figsize=(12, 6))
-        sns.boxplot(data=numeric_data)
-        plt.title("Boxplot of Numeric Data")
-        plt.savefig("boxplot.png")
+# Generate distribution plots for numeric columns to understand data spread and outliers
+def create_distribution_plots():
+    for col in numeric_df.columns:
+        # Limit bins for columns with large unique values
+        num_unique = numeric_df[col].nunique()
+        bins = 50 if num_unique > 100 else min(num_unique, 20)
+
+        # Explanation: Bin limits are chosen to balance detail and readability.
+        plt.figure(figsize=(8, 6))
+        sns.histplot(numeric_df[col].dropna(), kde=True, color="blue", bins=bins)
+        plt.title(f"Distribution of {col}")
+        plt.xlabel(col)
+        plt.ylabel("Frequency")
+        plt.grid(True)
+        plt.savefig(f"distribution_{col}.png")
         plt.close()
 
-        console.log("[cyan]Generating histograms...")
-        numeric_data.hist(figsize=(12, 10), bins=20, color='teal')
-        plt.suptitle("Histograms of Numeric Data")
-        plt.savefig("histograms.png")
+# Perform outlier detection using Isolation Forest
+def outlier_detection():
+    if not numeric_df.empty:
+        model = IsolationForest(contamination=0.05, random_state=42)
+        outliers = model.fit_predict(numeric_df)
+        df["Outlier"] = (outliers == -1)
+        plt.figure(figsize=(8, 6))
+        sns.countplot(x="Outlier", data=df)
+        plt.title("Outlier Detection")
+        plt.savefig("outlier_detection.png")
         plt.close()
 
-    if 'Cluster' in data.columns:
-        console.log("[cyan]Generating cluster pairplot...")
-        sns.pairplot(data, hue='Cluster', palette="tab10")
-        plt.savefig("cluster_pairplot.png")
+# Perform clustering analysis using KMeans
+def clustering_analysis():
+    if numeric_df.shape[1] > 1:
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(numeric_df)
+        kmeans = KMeans(n_clusters=3, random_state=42, n_init='auto')
+        clusters = kmeans.fit_predict(scaled_data)
+        df["Cluster"] = clusters
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x=numeric_df.columns[0], y=numeric_df.columns[1], hue="Cluster", data=df, palette="viridis")
+        plt.title("Clustering Analysis")
+        plt.savefig("clustering_analysis.png")
         plt.close()
 
-def encode_image(filepath):
-    """Encode an image to base64 for LLM integration."""
-    with open(filepath, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+# Perform PCA for dimensionality reduction
+def pca_analysis():
+    if numeric_df.shape[1] > 2:
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(numeric_df)
+        pca = PCA(n_components=2)
+        components = pca.fit_transform(scaled_data)
+        df["PCA1"] = components[:, 0]
+        df["PCA2"] = components[:, 1]
+        plt.figure(figsize=(8, 6))
+        sns.scatterplot(x="PCA1", y="PCA2", hue="Cluster", data=df, palette="viridis")
+        plt.title("PCA Analysis")
+        plt.savefig("pca_analysis.png")
+        plt.close()
 
-def request_llm_insights(summary):
-    """Request insights from LLM based on summary statistics."""
-    console.log("[cyan]Requesting insights from LLM...")
-    llm_response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a data analysis assistant."},
-            {"role": "user", "content": f"Here is the dataset overview: {summary}. Suggest initial analyses."}
-        ]
-    )
-    return llm_response.choices[0].message['content']
+# Dynamic LLM Interactions
+# Query the LLM dynamically after each major step and integrate its feedback
+try:
+    correlation_prompt = f"Analyze this correlation matrix: {correlation.to_dict() if correlation is not None else 'No correlations available.'}"
+    correlation_insights = query_llm(correlation_prompt)
+    print("Correlation Insights:", correlation_insights)
 
-def request_visual_insights(image_data, description):
-    """Request LLM to interpret visualizations."""
-    console.log("[cyan]Requesting visualization insights from LLM...")
-    llm_response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert data visualization analyst."},
-            {"role": "user", "content": f"Here is an image of {description}. Analyze its insights."},
-            {"role": "user", "content": image_data}
-        ]
-    )
-    return llm_response.choices[0].message['content']
+    outlier_prompt = f"Outlier detection summary: {df['Outlier'].sum() if 'Outlier' in df else 'No outliers detected.'}"
+    outlier_insights = query_llm(outlier_prompt)
+    print("Outlier Insights:", outlier_insights)
 
-def request_story_generation(summary, insights, visual_insights):
-    """Generate a Markdown story with LLM."""
-    console.log("[cyan]Requesting story generation from LLM...")
-    story_prompt = (
-        f"Using the analysis and visualizations, generate a Markdown report. "
-        f"Include dataset summary, analyses, insights, and implications. Dataset overview: {summary}. "
-        f"Insights: {insights}. Visualization Insights: {visual_insights}."
-    )
+    clustering_prompt = f"Clustering results summary: {df['Cluster'].value_counts().to_dict() if 'Cluster' in df else 'No clusters formed.'}"
+    clustering_insights = query_llm(clustering_prompt)
+    print("Clustering Insights:", clustering_insights)
 
-    story_response = openai.ChatCompletion.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are a data storytelling assistant."},
-            {"role": "user", "content": story_prompt}
-        ]
-    )
-    return story_response.choices[0].message['content']
+    pca_prompt = "Provide insights on PCA results and explain their significance."
+    pca_insights = query_llm(pca_prompt)
+    print("PCA Insights:", pca_insights)
 
-def analyze_and_visualize(filename):
-    try:
-        data = load_dataset(filename)
+except Exception as e:
+    print(f"Error during dynamic LLM interactions: {e}")
 
-        if data.empty:
-            console.log("[red]The dataset is empty. Exiting analysis.")
-            return
+# Use ThreadPoolExecutor to create visualizations concurrently
+# Use ThreadPoolExecutor to create visualizations concurrently
+with ThreadPoolExecutor() as executor:
+    executor.submit(create_correlation_heatmap)
+    executor.submit(create_distribution_plots)
+    executor.submit(outlier_detection)
+    executor.submit(clustering_analysis)
+    executor.submit(pca_analysis)
 
-        console.log("[green]Dataset loaded successfully. Performing analysis...")
+# Generate narrative with robust prompt
+# Create a detailed Markdown-formatted report summarizing the analysis
+narrative_prompt = f"""
+You are a data storytelling assistant.
+Based on the following details, create a Markdown-formatted report:
 
-        # Summarize dataset
-        summary = {
-            "columns": data.columns.tolist(),
-            "types": data.dtypes.astype(str).to_dict(),
-            "missing_values": data.isnull().sum().to_dict(),
-            "summary_stats": data.describe(include='all', datetime_is_numeric=True).to_dict(),
-        }
+- **Dataset Overview**: The dataset contains {df.shape[0]} rows and {df.shape[1]} columns. Columns include: {list(df.columns)}.
+- **Summary Statistics**: Key descriptive statistics include:
+  {summary[['mean', 'std', 'min', 'max']].to_dict()}.
+- **Missing Values**: Columns with missing values and their counts:
+  {missing_values[missing_values > 0].to_dict()}.
+- **Key Findings**:
+  - **Correlation Insights**: {correlation_insights if 'correlation_insights' in locals() else "No correlation insights available."}
+  - **Outlier Detection**: {outlier_insights if 'outlier_insights' in locals() else "No outlier insights available."}
+  - **Clustering Analysis**: {clustering_insights if 'clustering_insights' in locals() else "No clustering insights available."}
+  - **PCA Analysis**: {pca_insights if 'pca_insights' in locals() else "No PCA insights available."}
 
-        # Detect outliers and perform clustering
-        data = detect_outliers(data)
-        data = perform_clustering(data)
-        data = perform_pca(data)
+Report should include:
+1. **Overview of the Dataset**: Include a brief description of the dataset and its features.
+2. **Key Findings from the Analysis**: Highlight major trends, patterns, and anomalies in the dataset, including insights from correlation, clustering, and PCA.
+3. **Visualizations**: Provide clear explanations for the visualizations created, including statistical methods and advanced analyses.
+4. **Actionable Insights and Recommendations**: Suggest practical steps or decisions based on the analysis results.
+5. **Summary of Data Issues**: Note any missing data, outliers, or potential quality concerns.
+6. **Next Steps**: Recommend further analyses, cleaning, or data collection to improve the dataset.
 
-        # Visualize data
-        visualize_data(data)
+Use bullet points, subheaders, and bold text where applicable to make the report structured and easy to read.
+"""
+try:
+    story = query_llm(narrative_prompt)
+except Exception as e:
+    print(f"Failed to generate narrative from LLM: {e}")
+    story = "Unable to generate narrative due to API issues."
 
-        # Request insights from LLM
-        insights = request_llm_insights(summary)
+# Save narrative to README.md in the appropriate directory
+# The README file includes the generated narrative and links to visualizations
+output_dir = os.path.splitext(os.path.basename(dataset_path))[0]
+os.makedirs(output_dir, exist_ok=True)
+readme_path = os.path.join(output_dir, "README.md")
+with open(readme_path, "w") as f:
+    f.write("# Automated Analysis Report\n\n")
+    f.write(story)
+    f.write("\n\n## Visualizations\n")
+    f.write("![Correlation Heatmap](correlation_heatmap.png)\n")
+    for col in numeric_df.columns:
+        f.write(f"![Distribution of {col}](distribution_{col}.png)\n")
+    f.write("![Outlier Detection](outlier_detection.png)\n")
+    f.write("![Clustering Analysis](clustering_analysis.png)\n")
+    f.write("![PCA Analysis](pca_analysis.png)\n")
 
-        # Encode visualizations and request LLM insights
-        visual_insights = []
-        if os.path.exists("correlation_heatmap.png"):
-            visual_insights.append(request_visual_insights(encode_image("correlation_heatmap.png"), "correlation heatmap"))
-        if os.path.exists("cluster_pairplot.png"):
-            visual_insights.append(request_visual_insights(encode_image("cluster_pairplot.png"), "cluster pairplot"))
-        if os.path.exists("pca_scatterplot.png"):
-            visual_insights.append(request_visual_insights(encode_image("pca_scatterplot.png"), "PCA scatterplot"))
+# Ensure all outputs are in the specified directories
+# Move generated files to the output directory
+def safe_move(src, dst):
+    """Move a file only if it exists."""
+    if os.path.exists(src):
+        shutil.move(src, dst)
 
-        # Generate Markdown story
-        story = request_story_generation(summary, insights, " ".join(visual_insights))
-        with open("README.md", "w") as f:
-            f.write(story)
-            f.write("\n![Correlation Heatmap](correlation_heatmap.png)\n")
-            f.write("![Boxplot](boxplot.png)\n")
-            f.write("![Histograms](histograms.png)\n")
-            if 'Cluster' in data.columns:
-                f.write("![Cluster Pairplot](cluster_pairplot.png)\n")
-            if os.path.exists("pca_scatterplot.png"):
-                f.write("![PCA Scatterplot](pca_scatterplot.png)\n")
+safe_move("correlation_heatmap.png", os.path.join(output_dir, "correlation_heatmap.png"))
+safe_move("outlier_detection.png", os.path.join(output_dir, "outlier_detection.png"))
+safe_move("clustering_analysis.png", os.path.join(output_dir, "clustering_analysis.png"))
+safe_move("pca_analysis.png", os.path.join(output_dir, "pca_analysis.png"))
+for col in numeric_df.columns:
+    distribution_plot = f"distribution_{col}.png"
+    safe_move(distribution_plot, os.path.join(output_dir, distribution_plot))
 
-        console.log("[bold green]Analysis complete. Outputs saved.")
+print(f"Analysis complete. Results saved in {output_dir}/")
 
-    except Exception as e:
-        console.log(f"[red]An error occurred:[/] {e}")
-
-if __name__== "__main__":
-    console.log("[bold blue]Starting autolysis script...")
-    if len(sys.argv) != 2:
-        console.log("[red]Usage: uv run autolysis.py <dataset.csv>")
-        sys.exit(1)
-
-    dataset_file = sys.argv[1]
-    console.log(f"[bold yellow]Processing dataset file:[/] {dataset_file}")
-    analyze_and_visualize(dataset_file)
